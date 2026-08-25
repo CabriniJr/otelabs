@@ -1,0 +1,26 @@
+# Contexto: head-based | Coletor: agressivo
+# Mesma lógica do sweet spot, taxa bem mais baixa (1%) — extremo de alta
+# performance / baixa confiança.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  probabilistic_sampler:
+    sampling_percentage: 1
+  batch: {}
+
+exporters:
+  file:
+    path: /out/traces.json
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [probabilistic_sampler, batch]
+      exporters: [file]

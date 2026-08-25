@@ -1,0 +1,100 @@
+# 2 contextos (head_based, tail_based) x 3 coletores (deterministico,
+# sweet_spot, agressivo) = 6 pares app+coletor. Cada par é isolado (rede
+# interna do compose), sem interferir nos outros.
+#
+# Suba só o par que for testar por vez, pra não competir por CPU/rede no
+# seu laptop e enviesar as latências:
+#
+#   docker compose up --build otel-collector-head-based-deterministico app-head-based-deterministico
+#
+# Ver EXPERIMENTO.md pro passo a passo completo das 6 execuções.
+
+x-collector: &collector-defaults
+  image: otel/opentelemetry-collector-contrib:0.108.0
+  command: ["--config=/etc/otelcol-contrib/config.yaml"]
+  restart: "no"
+
+x-app: &app-defaults
+  build: ./demo-app
+  restart: "no"
+
+services:
+  # ---------------------------------------------------------------- head_based
+  otel-collector-head-based-deterministico:
+    <<: *collector-defaults
+    volumes:
+      - ./otel-config/head_based/deterministico.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./out/head_based/deterministico:/out
+  app-head-based-deterministico:
+    <<: *app-defaults
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector-head-based-deterministico:4318
+      OTEL_SERVICE_NAME: demo-app-head-based-deterministico
+    ports: ["8001:8000"]
+    depends_on: [otel-collector-head-based-deterministico]
+
+  otel-collector-head-based-sweet-spot:
+    <<: *collector-defaults
+    volumes:
+      - ./otel-config/head_based/sweet_spot.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./out/head_based/sweet_spot:/out
+  app-head-based-sweet-spot:
+    <<: *app-defaults
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector-head-based-sweet-spot:4318
+      OTEL_SERVICE_NAME: demo-app-head-based-sweet-spot
+    ports: ["8002:8000"]
+    depends_on: [otel-collector-head-based-sweet-spot]
+
+  otel-collector-head-based-agressivo:
+    <<: *collector-defaults
+    volumes:
+      - ./otel-config/head_based/agressivo.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./out/head_based/agressivo:/out
+  app-head-based-agressivo:
+    <<: *app-defaults
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector-head-based-agressivo:4318
+      OTEL_SERVICE_NAME: demo-app-head-based-agressivo
+    ports: ["8003:8000"]
+    depends_on: [otel-collector-head-based-agressivo]
+
+  # ---------------------------------------------------------------- tail_based
+  otel-collector-tail-based-deterministico:
+    <<: *collector-defaults
+    volumes:
+      - ./otel-config/tail_based/deterministico.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./out/tail_based/deterministico:/out
+  app-tail-based-deterministico:
+    <<: *app-defaults
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector-tail-based-deterministico:4318
+      OTEL_SERVICE_NAME: demo-app-tail-based-deterministico
+    ports: ["8004:8000"]
+    depends_on: [otel-collector-tail-based-deterministico]
+
+  otel-collector-tail-based-sweet-spot:
+    <<: *collector-defaults
+    volumes:
+      - ./otel-config/tail_based/sweet_spot.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./out/tail_based/sweet_spot:/out
+  app-tail-based-sweet-spot:
+    <<: *app-defaults
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector-tail-based-sweet-spot:4318
+      OTEL_SERVICE_NAME: demo-app-tail-based-sweet-spot
+    ports: ["8005:8000"]
+    depends_on: [otel-collector-tail-based-sweet-spot]
+
+  otel-collector-tail-based-agressivo:
+    <<: *collector-defaults
+    volumes:
+      - ./otel-config/tail_based/agressivo.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./out/tail_based/agressivo:/out
+  app-tail-based-agressivo:
+    <<: *app-defaults
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector-tail-based-agressivo:4318
+      OTEL_SERVICE_NAME: demo-app-tail-based-agressivo
+    ports: ["8006:8000"]
+    depends_on: [otel-collector-tail-based-agressivo]

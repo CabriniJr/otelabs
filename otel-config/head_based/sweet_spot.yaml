@@ -1,0 +1,26 @@
+# Contexto: head-based | Coletor: sweet spot
+# probabilistic_sampler puro — cada span tem 15% de chance de ser
+# exportado, independente do domínio, erro ou latência.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  probabilistic_sampler:
+    sampling_percentage: 15
+  batch: {}
+
+exporters:
+  file:
+    path: /out/traces.json
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [probabilistic_sampler, batch]
+      exporters: [file]

@@ -1,0 +1,42 @@
+# Contexto: tail-based | Coletor: agressivo
+# Mesma lógica do sweet spot (erros e cauda SEMPRE mantidos), mas a
+# taxa-base do tráfego normal cai pra 1%. É aqui que o tail-based deve se
+# diferenciar mais do head-based agressivo: mesmo agressivo, a confiança
+# na taxa de erro não deveria desmoronar, porque erros continuam 100%
+# retidos.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  tail_sampling:
+    decision_wait: 2s
+    policies:
+      - name: erros
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: cauda_lenta
+        type: latency
+        latency:
+          threshold_ms: 400
+      - name: base_rate
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 1
+  batch: {}
+
+exporters:
+  file:
+    path: /out/traces.json
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling, batch]
+      exporters: [file]

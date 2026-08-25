@@ -1,0 +1,44 @@
+# Contexto: tail-based | Coletor: sweet spot
+# tail_sampling com 3 políticas combinadas por OR: qualquer uma que
+# "vote" amostrar já mantém a trace. Erros e latência alta (cauda) são
+# SEMPRE mantidos; o tráfego "normal" restante é amostrado a 15%.
+#
+# Simplificação assumida (documentada no README/EXPERIMENTO.md): o
+# threshold de latência é único pra todos os domínios, não por domínio —
+# fica como próximo passo de refinamento.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  tail_sampling:
+    decision_wait: 2s
+    policies:
+      - name: erros
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: cauda_lenta
+        type: latency
+        latency:
+          threshold_ms: 400
+      - name: base_rate
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 15
+  batch: {}
+
+exporters:
+  file:
+    path: /out/traces.json
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling, batch]
+      exporters: [file]
