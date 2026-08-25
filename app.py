@@ -26,6 +26,7 @@ import streamlit as st
 from scipy import stats as sp_stats
 
 from utils import stats as st_stats
+from utils import equivalence as eq
 
 # ---------------------------------------------------------------------------
 # Paleta (dataviz skill — paleta validada, categórica em ordem fixa,
@@ -812,9 +813,10 @@ with top_analysis:
     k2.metric("Domínios/sinais", len(domains))
     k3.metric("Contextos carregados", sum(1 for c in CONTEXTS if data[c["key"]]["deterministico"][0] is not None))
 
-    tab_overview, tab_compare, tab_tradeoff, tab_headtail, tab_dynamic = st.tabs(
+    (tab_overview, tab_compare, tab_tradeoff, tab_best, tab_headtail,
+        tab_dynamic) = st.tabs(
         ["Visão geral", "Comparação dos coletores", "Trade-off & sweet spot",
-         "Head vs. Tail", "Sampling dinâmico"])
+         "Melhor sampling (por teste)", "Head vs. Tail", "Sampling dinâmico"])
 
     # ---------------------------------------------------------------------------
     # TAB 1 — Visão geral, em leitura F: a pergunta central e os KPIs na barra
@@ -1171,7 +1173,302 @@ with top_analysis:
                     c.metric(r["domain"], f"{r['taxa_ideal']*100:.1f}%", f"score {r['score']:.2f}")
 
     # ---------------------------------------------------------------------------
-    # TAB 4 — Head-based vs. Tail-based, lado a lado
+    # TAB 4 — Melhor sampling POR TESTE: em vez de assumir um sweet spot,
+    # descobrir a menor taxa que ainda passa num teste de equivalência.
+    # ---------------------------------------------------------------------------
+    with tab_best:
+        st.subheader("Qual é a melhor taxa de sampling? — chegando lá por teste")
+        st.markdown(
+            "A aba anterior **assume** um sweet spot: ela maximiza um score que "
+            "depende de escolhas suas (α e a prioridade do sinal). Aqui a pergunta "
+            "é invertida e não há escolha de negócio nenhuma:\n\n"
+            "> Fixada uma **banda de tolerância** — *a estimativa precisa ficar a no "
+            "máximo ±X% da verdade* — qual é a **menor taxa** em que a amostra ainda "
+            "passa nesse critério de forma confiável?\n\n"
+            "O run determinístico de cada contexto é tratado como a verdade. Para cada "
+            "taxa candidata, ele é reamostrado centenas de vezes **aplicando a política "
+            "real daquele contexto**, e em cada réplica testamos se o IC inteiro cabe "
+            "dentro da banda (teste de equivalência, TOST). A fração de réplicas "
+            "aprovadas é o **poder** daquela taxa; a recomendada é a menor com poder "
+            "acima do alvo.")
+
+        cfg1, cfg2, cfg3, cfg4 = st.columns(4)
+        tol_lat = cfg1.slider("Tolerância — latência média (±%)", 1.0, 30.0, 5.0, 0.5,
+                                key="tol_lat") / 100
+        tol_err = cfg2.slider("Tolerância — taxa de erro (±%)", 5.0, 150.0, 50.0, 5.0,
+                                key="tol_err") / 100
+        target = cfg3.slider("Poder alvo", 0.50, 0.99, 0.95, 0.01, key="tost_target")
+        n_boot = cfg4.select_slider("Réplicas por taxa", [50, 100, 200, 400], value=200,
+                                      key="tost_boot",
+                                      help="Mais réplicas = curva de poder menos ruidosa, "
+                                           "porém mais lenta.")
+
+        RATE_GRID = np.geomspace(0.005, 1.0, 22)
+        POLICY = {"head_based": "head", "tail_based": "tail"}
+
+        # A simulação é cara (milhares de reamostragens) e o Streamlit
+        # reexecuta o script inteiro a cada interação em QUALQUER aba. Rodar
+        # sob demanda mantém o app leve; o resultado fica na sessão até os
+        # parâmetros mudarem.
+        params = (round(tol_lat, 4), round(tol_err, 4), round(target, 3),
+                  int(n_boot), float(confidence))
+        cached = st.session_state.get("tost_result")
+        fresh = cached is not None and cached["params"] == params
+
+        run_col, msg_col = st.columns([1, 3])
+        run_now = run_col.button("Rodar a simulação", type="primary",
+                                    disabled=fresh, key="tost_run")
+        if fresh:
+            msg_col.caption("Resultado atual corresponde aos parâmetros acima. "
+                            "Mude uma tolerância para habilitar nova rodada.")
+        elif cached is not None:
+            msg_col.warning("Os parâmetros mudaram — rode de novo para atualizar.")
+
+        if run_now:
+            curves, floors, recs = {}, {}, []
+            with st.spinner("Reamostrando e testando equivalência…"):
+                for ctx in CONTEXTS:
+                    ck = ctx["key"]
+                    det_df, _ = data[ck]["deterministico"]
+                    if det_df is None:
+                        continue
+                    for d in domains:
+                        sub = det_df[det_df["domain"] == d]
+                        if len(sub) < 2:
+                            continue
+                        lat_arr = sub["latency_ms"].to_numpy(dtype=float)
+                        err_arr = sub["is_error"].to_numpy(dtype=float)
+                        floors[(ck, d)] = eq.baseline_floor(lat_arr, err_arr, confidence)
+                        curve = eq.power_curve(lat_arr, err_arr, RATE_GRID,
+                                                policy=POLICY[ck], tol_lat=tol_lat,
+                                                tol_err=tol_err, confidence=confidence,
+                                                n_boot=int(n_boot))
+                        curves[(ck, d)] = curve
+                        mv = eq.min_viable_rate(curve, target=target)
+                        recs.append({
+                            "contexto": context_labels[ck], "contexto_key": ck,
+                            "domain": d, "prioridade": priority[d],
+                            "taxa_recomendada": mv["rate"] if mv else np.nan,
+                            "retencao_efetiva": mv["retencao_efetiva"] if mv else np.nan,
+                            "poder": mv["poder"] if mv else np.nan,
+                        })
+            st.session_state["tost_result"] = {
+                "params": params, "curves": curves, "floors": floors,
+                "rec_df": pd.DataFrame(recs)}
+            cached = st.session_state["tost_result"]
+
+        if cached is None:
+            st.info(
+                "Ajuste as tolerâncias acima e clique em **Rodar a simulação**. "
+                "São alguns milhares de reamostragens do baseline (uns poucos "
+                "segundos) — por isso não roda sozinho a cada interação.")
+
+        else:
+            curves, floors, rec_df = (cached["curves"], cached["floors"],
+                                        cached["rec_df"])
+
+            # ── O piso: bandas abaixo dele são inatingíveis em QUALQUER taxa ──
+            impossiveis = [
+                f"**{d}** ({context_labels[ck].split('—')[0].strip()}): piso da taxa de erro "
+                f"é ±{f['err']:.0%}"
+                for (ck, d), f in floors.items()
+                if not np.isnan(f.get("err", np.nan)) and f["err"] > tol_err
+            ]
+            if impossiveis:
+                st.warning(
+                    "**Banda mais apertada que o próprio baseline.** Mesmo capturando "
+                    "100% do tráfego, estes sinais já não atingem a tolerância pedida — "
+                    "o limite aqui é o **tamanho do experimento**, não o sampling. "
+                    "Nenhuma taxa resolve; só mais requisições resolvem.\n\n"
+                    + "\n".join(f"- {t}" for t in impossiveis))
+
+            # ── Curvas de poder, um subplot por contexto ──
+            fig_pw = make_subplots(rows=1, cols=len(CONTEXTS), shared_yaxes=True,
+                                    subplot_titles=[context_labels[c["key"]] for c in CONTEXTS])
+            for i, ctx in enumerate(CONTEXTS, start=1):
+                ck = ctx["key"]
+                for d in domains:
+                    curve = curves.get((ck, d))
+                    if curve is None or curve.empty:
+                        continue
+                    fig_pw.add_trace(go.Scatter(
+                        x=curve["retencao_efetiva"], y=curve["poder_conjunto"],
+                        mode="lines", name=d, legendgroup=d, showlegend=(i == 1),
+                        line=dict(color=colors[d], width=2.5),
+                        hovertemplate=(f"{d}<br>retenção: %{{x:.1%}}"
+                                        "<br>poder: %{y:.0%}<extra></extra>")),
+                        row=1, col=i)
+                fig_pw.add_hline(y=target, line=dict(color=INK_MUTED, width=1, dash="dash"),
+                                    row=1, col=i)
+            # Ticks fixos: no eixo log a formatação automática amontoa
+            # rótulos ("40%50%60%…") e fica ilegível.
+            _ticks = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]
+            fig_pw.update_xaxes(
+                type="log", tickmode="array", tickvals=_ticks,
+                ticktext=[f"{t:.1%}".replace(".0", "") for t in _ticks])
+            fig_pw.update_yaxes(tickformat=".0%", range=[-0.03, 1.03])
+            fig_pw = base_layout(
+                fig_pw, f"Poder do teste de equivalência vs. retenção efetiva "
+                        f"(alvo tracejado = {target:.0%})",
+                "Retenção efetiva (log)", "Poder", "Sinal")
+            st.plotly_chart(fig_pw, width='stretch')
+            st.caption(
+                "O eixo X é a **retenção efetiva**, não a taxa nominal — é o que "
+                "realmente se paga em volume exportado, e é a única forma de comparar "
+                "head-based e tail-based de forma justa (no tail-based a retenção é "
+                "sempre maior que a taxa configurada, porque erros e cauda entram "
+                "sempre). Curvas mais à esquerda = política mais eficiente.")
+
+            # ── A resposta ──
+            st.markdown("#### A resposta, por sinal e por contexto")
+            show_rec = rec_df.copy()
+            show_rec["taxa_recomendada"] = show_rec["taxa_recomendada"].map(
+                lambda v: f"{v:.1%}" if not np.isnan(v) else "inatingível")
+            show_rec["retencao_efetiva"] = show_rec["retencao_efetiva"].map(
+                lambda v: f"{v:.1%}" if not np.isnan(v) else "—")
+            show_rec["poder"] = show_rec["poder"].map(
+                lambda v: f"{v:.0%}" if not np.isnan(v) else "—")
+            st.dataframe(show_rec.drop(columns=["contexto_key"]), width='stretch',
+                            hide_index=True)
+
+            st.markdown(
+                "Um coletor tem **uma** configuração, então a taxa do contexto é ditada "
+                "pelo sinal mais exigente:")
+            ctx_cols = st.columns(len(CONTEXTS))
+            for col, ctx in zip(ctx_cols, CONTEXTS):
+                ck = ctx["key"]
+                sub = rec_df[rec_df["contexto_key"] == ck]
+                viaveis = sub.dropna(subset=["taxa_recomendada"])
+                if viaveis.empty:
+                    col.metric(context_labels[ck].split("—")[0].strip(), "inatingível",
+                                "nenhum sinal passa", delta_color="off")
+                    continue
+                i_max = viaveis["taxa_recomendada"].idxmax()
+                binding = viaveis.loc[i_max]
+                n_fora = len(sub) - len(viaveis)
+                col.metric(
+                    context_labels[ck].split("—")[0].strip(),
+                    f"{binding['taxa_recomendada']:.1%}",
+                    f"ditada por {binding['domain']} ({binding['prioridade']})"
+                    + (f" · {n_fora} sinal(is) inatingível(is)" if n_fora else ""),
+                    delta_color="off")
+                col.caption(f"retenção efetiva: {binding['retencao_efetiva']:.1%}")
+
+            # ── Validação contra os coletores que rodaram de verdade ──
+            st.markdown("#### Validação: a simulação previu os coletores reais?")
+            st.caption(
+                "A simulação só vale se descrever o que os coletores de fato "
+                "entregaram. Abaixo, o poder previsto na retenção de cada coletor real "
+                "vs. o que aquele CSV realmente exportou — se o IC medido no dado real "
+                "cabe na mesma banda de tolerância.")
+            val_rows = []
+            for ctx in CONTEXTS:
+                ck = ctx["key"]
+                det_df, _ = data[ck]["deterministico"]
+                if det_df is None:
+                    continue
+                for run in RUNS:
+                    if run["key"] == "deterministico":
+                        continue
+                    rdf, _ = data[ck][run["key"]]
+                    if rdf is None:
+                        continue
+                    for d in domains:
+                        base = det_df[det_df["domain"] == d]
+                        real = rdf[rdf["domain"] == d]
+                        curve = curves.get((ck, d))
+                        if curve is None or curve.empty or len(base) < 2 or len(real) < 2:
+                            continue
+                        ret = len(real) / len(base)
+                        prev = float(np.interp(ret, curve["retencao_efetiva"],
+                                                curve["poder_conjunto"]))
+                        mean_base = float(base["latency_ms"].mean())
+                        p_base = float(base["is_error"].mean())
+                        # Mesmo estimador da simulação: reponderado no
+                        # tail-based, clássico no head-based.
+                        rc = eq.real_run_ci(
+                            base["latency_ms"].to_numpy(dtype=float),
+                            base["is_error"].to_numpy(dtype=float),
+                            real["latency_ms"].to_numpy(dtype=float),
+                            real["is_error"].to_numpy(dtype=float),
+                            policy=POLICY[ck], confidence=confidence)
+                        _, lat_lo, lat_hi = rc["lat"]
+                        _, err_lo, err_hi = rc["err"]
+                        ok_lat = (lat_lo >= mean_base * (1 - tol_lat)
+                                    and lat_hi <= mean_base * (1 + tol_lat))
+                        ok_err = (p_base > 0 and err_lo >= p_base * (1 - tol_err)
+                                    and err_hi <= p_base * (1 + tol_err))
+                        val_rows.append({
+                            "contexto": context_labels[ck], "coletor": run["label"],
+                            "sinal": d, "retenção real": f"{ret:.1%}",
+                            "poder previsto": f"{prev:.0%}",
+                            "latência real passou": "sim" if ok_lat else "não",
+                            "taxa de erro real passou": "sim" if ok_err else "não",
+                            "previsão bateu": "sim" if ((prev >= 0.5) == (ok_lat and ok_err))
+                                                else "não",
+                        })
+            if val_rows:
+                st.dataframe(pd.DataFrame(val_rows), width='stretch', hide_index=True)
+                acertos = sum(1 for r in val_rows if r["previsão bateu"] == "sim")
+                st.info(
+                    f"**Como ler.** A previsão \"bateu\" quando poder previsto alto "
+                    f"acompanha o dado real passando — e poder baixo acompanha o dado "
+                    f"real reprovando. Aqui: **{acertos} de {len(val_rows)}** "
+                    f"combinações. O dado real é medido com o **mesmo estimador** da "
+                    "simulação (reponderado no tail-based, clássico no head-based), "
+                    "reconstruindo a probabilidade de retenção de cada span exportado — "
+                    "sem isso a comparação mediria o estimador, não a política.\n\n"
+                    "**Limitação conhecida.** As divergências que sobram concentram-se "
+                    "na latência do tail-based. A reconstrução assume que o coletor "
+                    "usou como corte de cauda o p95 do baseline, mas o processor "
+                    "`tail_sampling` calcula o próprio limiar na janela dele — então a "
+                    "probabilidade de retenção que atribuímos a cada span é aproximada, "
+                    "e sobra viés residual na média. Fechar essa diferença exigiria o "
+                    "coletor exportar a probabilidade de amostragem junto do span "
+                    "(que é, aliás, o que a especificação de OTel prevê para métricas "
+                    "corretas sob sampling).")
+
+            # ── O viés do tail-based ──
+            with st.expander("Por que o tail-based precisa de reponderação (e o head não)"):
+                st.markdown(
+                    """
+    O tail-based retém **100% dos erros e da cauda p95**. A amostra que ele
+    produz não é uma miniatura do tráfego: ela é, de propósito, enriquecida de
+    casos ruins. Medir a taxa de erro contando linhas nessa amostra dá um número
+    sistematicamente **acima** da verdade — e que não converge para a verdade em
+    taxa nenhuma, porque o viés é da política, não do tamanho da amostra.
+
+    A correção é a padrão em amostragem com probabilidades desiguais
+    (Horvitz–Thompson): cada span vale `1/P(ser retido)`. Um span de erro, sempre
+    retido, vale 1; um span comum retido a 15% vale 6,67 — ele "representa" os
+    outros que ficaram de fora.
+
+    ```
+    taxa de erro estimada = Σ (peso × é_erro) / Σ peso
+    ```
+
+    O ganho aparece na variância. A incerteza da estimativa vem apenas dos spans
+    que **poderiam** não ter sido retidos: o termo de variância de cada span
+    carrega um fator `(1 − P(ser retido))`, que é **zero** para tudo que a
+    política sempre guarda. No tail-based todos os erros estão lá, então o
+    numerador é conhecido exatamente e a única incerteza está no denominador — o
+    volume total de tráfego. É por isso que, na mesma retenção efetiva, o
+    tail-based estima taxa de erro com muito mais precisão que uma amostra
+    uniforme: ele não está "com sorte", está guardando exatamente as linhas raras
+    que uma amostra uniforme perderia.
+
+    O head-based não precisa de nada disso: com todo mundo retido à mesma
+    probabilidade, os pesos são iguais e se cancelam — a média simples já é o
+    estimador correto.
+
+    As curvas de poder acima **já usam a versão reponderada** no tail-based; sem
+    ela a comparação mediria a ingenuidade do estimador, não a qualidade da
+    política. A verificação dessas propriedades está em
+    `scripts/check_equivalence.py`.
+                    """)
+
+    # ---------------------------------------------------------------------------
+    # TAB 5 — Head-based vs. Tail-based, lado a lado
     # ---------------------------------------------------------------------------
     with tab_headtail:
         st.subheader("Head-based vs. tail-based — mesma taxa nominal, confiança diferente")
