@@ -29,22 +29,37 @@ from utils import stats as st_stats
 
 # ---------------------------------------------------------------------------
 # Paleta (dataviz skill — paleta validada, categórica em ordem fixa,
-# sequencial azul, divergente azul<->vermelho, cores de status)
+# sequencial azul, divergente azul<->vermelho, cores de status) — ajustada
+# para o tema escuro nativo do Streamlit (ver .streamlit/config.toml)
 # ---------------------------------------------------------------------------
-CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
-                "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
-DIVERGING = [[0.0, "#e34948"], [0.5, "#f0efec"], [1.0, "#2a78d6"]]
-STATUS = {"good": "#0ca30c", "warning": "#fab219", "serious": "#ec835a", "critical": "#d03b3b"}
-INK_PRIMARY = "#0b0b0b"
-INK_SECONDARY = "#52514e"
-INK_MUTED = "#898781"
-GRID = "#e1e0d9"
-SURFACE = "#fcfcfb"
+CATEGORICAL = ["#5b9bf2", "#f0895c", "#3fd19e", "#f0b93f",
+                "#f295bd", "#3fd63f", "#8b7ae0", "#f2726f"]
+DIVERGING = [[0.0, "#f2726f"], [0.5, "#3a3d47"], [1.0, "#5b9bf2"]]
+STATUS = {"good": "#3fd63f", "warning": "#f0b93f", "serious": "#f0895c", "critical": "#f2726f"}
+INK_PRIMARY = "#f5f5f3"
+INK_SECONDARY = "#c9c8c3"
+INK_MUTED = "#8b8a86"
+GRID = "#30333c"
+SURFACE = "#12151c"
 
 DOMAIN_PRIORITY = ["pix", "checkout", "site_latency", "api_generic"]
 REQUIRED_COLS = {"trace_id", "timestamp", "domain", "latency_ms", "is_error"}
 SOURCE_LABEL = {"upload": "upload manual", "real": "teste real (local, reduzido)",
                     "sample": "exemplo sintético"}
+
+# Score de prioridade P1–P4 (substitui o slider contínuo de importância):
+# cada domínio recebe uma prioridade de negócio discreta, e cada nível
+# mapeia para um peso fixo de importância no score composto. P1 = sinal
+# crítico (ex.: PIX — precisa de sampling mais determinístico/conservador),
+# P4 = sinal tolerante (pode sofrer sampling agressivo sem grande perda).
+PRIORITY_LEVELS = {"P1": 1.0, "P2": 0.7, "P3": 0.4, "P4": 0.2}
+PRIORITY_DESC = {
+    "P1": "crítico — precisa de sampling quase determinístico",
+    "P2": "importante — tolera sampling moderado",
+    "P3": "secundário — tolera sampling mais agressivo",
+    "P4": "tolerante — pode sofrer sampling bem agressivo",
+}
+DEFAULT_PRIORITY = {"pix": "P1", "checkout": "P2", "site_latency": "P3", "api_generic": "P4"}
 
 CONTEXTS = [
     {"key": "head_based", "default_label": "Contexto 1 — Head-based (probabilístico)"},
@@ -97,13 +112,81 @@ def domain_colors(domains):
 
 
 def default_importance(domain):
-    return {"pix": 1.0, "checkout": 0.6, "site_latency": 0.35, "api_generic": 0.2}.get(domain, 0.5)
+    """Taxa inicial sugerida para o what-if de sampling dinâmico: o peso da
+    prioridade padrão do domínio (P1 = 100%, P4 = 20%)."""
+    return PRIORITY_LEVELS[DEFAULT_PRIORITY.get(domain, "P3")]
 
 
 def mean_ci(values, confidence, method):
     if method.startswith("Bootstrap"):
         return st_stats.bootstrap_mean_ci(values, confidence, n_boot=800)
     return st_stats.clt_mean_ci(values, confidence)
+
+
+def br(n) -> str:
+    """Inteiro no formato brasileiro (ponto como separador de milhar)."""
+    return f"{int(n):,}".replace(",", ".")
+
+
+def extrapolate_at_rate(sub, rate, confidence):
+    """Extrapola, a partir do baseline determinístico de UM domínio (`sub`),
+    quanto de confiança se perde ao amostrar a `rate`.
+
+    Não reamostra: usa o σ e a taxa de erro observados no run 100% e a
+    fórmula SE = σ/√n para calcular analiticamente a margem de erro (MOE)
+    relativa em qualquer taxa. É a mesma matemática da curva teórica da aba
+    "Trade-off & sweet spot", isolada aqui para ser reusada pelos hovers e
+    pelo slider da Visão geral.
+
+    Retorna dict com n_amostrado, lat_moe_pct, err_moe_pct, ganho e a
+    penalidade de confiança normalizada.
+    """
+    n_base = len(sub)
+    if n_base < 2:
+        return None
+    mean_base = float(sub["latency_ms"].mean())
+    std_base = float(sub["latency_ms"].std(ddof=1))
+    p_base = float(sub["is_error"].mean())
+    n_r = max(2, int(round(n_base * rate)))
+    se = std_base / np.sqrt(n_r)
+    t_crit = sp_stats.t.ppf(1 - (1 - confidence) / 2, df=n_r - 1)
+    lat_moe = st_stats.relative_moe(t_crit * se, mean_base)
+    err_ci = st_stats.wilson_ci(int(round(p_base * n_r)), n_r, confidence)
+    err_moe = st_stats.relative_moe(err_ci["halfwidth"], p_base)
+    return {"n_base": n_base, "n": n_r, "mean_base": mean_base, "std_base": std_base,
+            "p_base": p_base, "lat_moe_pct": lat_moe, "err_moe_pct": err_moe,
+            "halfwidth_ms": float(t_crit * se), "t_crit": float(t_crit),
+            "gain": st_stats.throughput_gain(rate)}
+
+
+def rate_series(df, domain, window_s=3, bucket_s=1):
+    """Série temporal de rate() normalizado, no espírito do `rate()` do
+    PromQL: conta eventos por bucket de tempo, divide pela duração do
+    bucket (eventos/s) e suaviza com uma média móvel de `window_s` buckets.
+
+    O eixo X é o tempo DECORRIDO desde o primeiro evento daquele run, não o
+    timestamp absoluto: os 6 coletores foram executados um de cada vez
+    (ver EXPERIMENTO.md), então só alinhando pelo início é que as curvas
+    ficam de fato sobrepostas e comparáveis.
+
+    Retorna a série em eventos/s do run recebido. Quem chama divide pela
+    taxa efetiva de retenção daquele coletor — assim as 3 séries ficam na
+    MESMA escala (estimativa da taxa real de requisições) e a única
+    diferença visível entre elas é a DISPERSÃO: quanto menos amostra, mais
+    ruidosa a estimativa, mesmo com a média correta.
+    """
+    sub = df[df["domain"] == domain]
+    if sub.empty:
+        return None
+    ts = pd.to_datetime(sub["timestamp"], utc=True, format="mixed")
+    elapsed = (ts - ts.min()).dt.total_seconds() // bucket_s * bucket_s
+    counts = elapsed.value_counts().sort_index()
+    if counts.empty:
+        return None
+    full_idx = np.arange(counts.index.min(), counts.index.max() + bucket_s, bucket_s)
+    counts = counts.reindex(full_idx, fill_value=0)
+    rate = counts / bucket_s
+    return rate.rolling(window_s, min_periods=1).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -185,9 +268,19 @@ moe_cap = st.sidebar.slider("MOE% considerada 'confiança perdida' (satura o sco
 st.sidebar.header("Score composto (throughput vs. confiança)")
 alpha = st.sidebar.slider("Peso: performance (1.0) vs. confiança (0.0)", 0.0, 1.0, 0.5, 0.05)
 
-st.sidebar.subheader("Importância de cada sinal (0–1)")
-importance = {d: st.sidebar.slider(f"Importância — {d}", 0.0, 1.0, default_importance(d), 0.05,
-                                     key=f"imp_{d}") for d in domains}
+st.sidebar.subheader("Prioridade de cada sinal (P1–P4)")
+st.sidebar.caption(
+    "A prioridade de negócio do sinal entra no score composto como peso da "
+    "penalidade de confiança: P1 (ex.: PIX) amplifica a perda de confiança e "
+    "empurra o sweet spot para taxas mais altas; P4 aceita sampling agressivo.")
+priority = {}
+for d in domains:
+    levels = list(PRIORITY_LEVELS)
+    default_level = DEFAULT_PRIORITY.get(d, "P3")
+    priority[d] = st.sidebar.selectbox(
+        f"Prioridade — {d}", levels, index=levels.index(default_level),
+        format_func=lambda p: f"{p} · {PRIORITY_DESC[p]}", key=f"prio_{d}")
+importance = {d: PRIORITY_LEVELS[priority[d]] for d in domains}
 
 # ---------------------------------------------------------------------------
 # Cálculo central: para cada (contexto, run, domínio) -> estatísticas reais,
@@ -234,17 +327,30 @@ if cmp_df.empty:
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Navegação de topo (estrutura exigida pelo CP1)
+# Navegação de topo — 3 áreas. A primeira agrupa, em sub-abas, as três
+# seções de portfólio exigidas pelo CP1 (Quem sou eu / Qualificações /
+# Skills); a segunda explica o que foi construído; a terceira é a análise.
 # ---------------------------------------------------------------------------
-top_home, top_qualif, top_skills, top_present, top_analysis = st.tabs(
-    ["Quem sou eu", "Minhas Qualificações", "Skills", "Apresentação", "Análise de Dados"])
+top_cv, top_work, top_analysis = st.tabs(
+    ["Currículo", "O que foi feito", "Dados & análise"])
+
+with top_cv:
+    top_home, top_qualif, top_skills = st.tabs(
+        ["Quem sou eu", "Minhas Qualificações", "Skills"])
 
 with top_home:
-    st.title("Luigi")
-    st.caption(
-        "Rascunho gerado com o Claude a partir do que já conversamos — "
-        "revise nomes, datas e detalhes antes de entregar.")
-    st.subheader("Platform Engineer Júnior · Observabilidade")
+    col_photo, col_intro = st.columns([1, 3])
+    with col_photo:
+        # Avatar do GitHub, versionado localmente (assets/avatar.jpg) para não
+        # depender de rede externa no deploy.
+        st.image("assets/avatar.jpg", width=200)
+        st.markdown(
+            "🔗 [github.com/CabriniJr](https://github.com/CabriniJr)  \n"
+            "🔗 [LinkedIn](https://www.linkedin.com/in/luigi-mendes-cabrini-775907349)")
+    with col_intro:
+        st.title("Luigi Mendes Cabrini")
+        st.subheader("Platform Engineer Júnior · Observabilidade")
+        st.caption("PagBank · FIAP — Engenharia de Software · São Bernardo do Campo, SP")
     st.markdown(
         """
 Atuo como **Platform Engineer Júnior com foco em Observabilidade** na
@@ -260,18 +366,16 @@ base de hardware/baixo nível ajuda no jeito como penso sobre performance
 e trade-offs em sistemas distribuídos hoje.
 
 Sou de **São Bernardo do Campo**, Grande São Paulo, e curso atualmente
-Data Science e Ciência da Computação Aplicada na **FIAP**, unindo minha
-atuação profissional em observabilidade com fundamentos de estatística e
-análise de dados — este dashboard é exatamente esse cruzamento: um
-laboratório real de sampling em coletores OTel, analisado com os
-conceitos estatísticos da disciplina.
+**Engenharia de Software** na **FIAP**, unindo minha atuação profissional
+em observabilidade com fundamentos de estatística e análise de dados —
+este dashboard é exatamente esse cruzamento: um laboratório real de
+sampling em coletores OTel, analisado com os conceitos estatísticos da
+disciplina.
 
 Meu momento atual é de **construir as bases**: leitura técnica contínua
 (Learning OpenTelemetry, Observability Engineering, Designing
 Data-Intensive Applications, o livro de SRE do Google) combinada com um
 laboratório prático por semana — este projeto é um desses labs.
-
-🔗 [LinkedIn — Luigi Mendes Cabrini](https://www.linkedin.com/in/luigi-mendes-cabrini-775907349)
         """)
 
 with top_qualif:
@@ -279,9 +383,9 @@ with top_qualif:
     st.subheader("Formação")
     st.markdown(
         """
-- **FIAP** — Data Science e Ciência da Computação Aplicada (em curso).
-  Disciplinas cursadas incluem Estatística, Banco de Dados, Java, Redes,
-  Programação Dinâmica, Agile e 3D.
+- **FIAP** — Engenharia de Software (em curso).
+  Disciplinas cursadas incluem Estatística (*Data Science and Statistical
+  Computing*), Banco de Dados, Java, Redes, Programação Dinâmica, Agile e 3D.
         """)
     st.subheader("Experiência profissional")
     st.markdown(
@@ -295,18 +399,30 @@ with top_qualif:
   plataformas NVIDIA Jetson.
         """)
     st.subheader("Projetos acadêmicos e pessoais")
+    st.markdown("**Concluídos / em andamento**")
     st.markdown(
         """
+- **Este dashboard** ([github.com/CabriniJr/otelabs](https://github.com/CabriniJr/otelabs))
+  — laboratório real de sampling em coletores OpenTelemetry: demo-app
+  instrumentada, 6 pipelines de coletor, gerador de carga e análise
+  estatística de confiança vs. performance.
 - **BrasilWatch AI / BrasilFire** (FIAP Global Solution) — previsão de
   incêndios florestais no Brasil usando YOLOv8, LSTM, TimescaleDB/PostGIS
   e dados públicos brasileiros.
-- **Este dashboard** — laboratório real de sampling em coletores
-  OpenTelemetry (demo-app instrumentada, 6 pipelines de coletor,
-  gerador de carga, análise estatística de confiança vs. performance).
 - **Atlas** — plataforma pessoal de automação inspirada em conceitos de
   Kubernetes (bot Telegram + dashboard web).
-- Contribuição em andamento a um **datasource Grafana para FIWARE**
-  (NGSI-v2 + STH-Comet), com foco em portfólio e open source.
+- **Datasource Grafana para FIWARE** (NGSI-v2 + STH-Comet) — contribuição
+  open source em andamento: plugin que expõe dados de contexto FIWARE
+  diretamente como fonte de dados no Grafana.
+        """)
+    st.markdown("**Próximo passo**")
+    st.markdown(
+        """
+- **Otelabs** — evoluir este experimento pontual para um conjunto
+  permanente de laboratórios de observabilidade: sampling dinâmico por
+  tag, comparação head-based × tail-based em escala maior (200k+
+  requisições por coletor) e cardinalidade de métricas. Este CP1 é o
+  primeiro lab do repositório.
         """)
     st.subheader("Idiomas")
     st.markdown(
@@ -344,31 +460,32 @@ with top_skills:
 - Aprendizado por construção: prefere aprender implementando (ex.:
   laboratórios como este) a só ler teoria
             """)
-    st.info(
-        "As skills e experiências acima vieram do histórico de conversas "
-        "com o Claude — revise antes da entrega e ajuste o que não estiver "
-        "atualizado.")
 
-with top_present:
-    NAVY, DEEPBLUE, TEAL = "#21295C", "#065A82", "#1C7293"
-    LIGHT_BLUE, OFFWHITE = "#CADCFC", "#F5F7FA"
+with top_work:
+    tab_slides, tab_pipeline, tab_method = st.tabs(
+        ["Apresentação (slides)", "Pipeline do experimento", "Metodologia"])
+
+with tab_slides:
+    # Paleta dos slides, adaptada ao tema escuro do app.
+    NAVY, DEEPBLUE, TEAL = "#1b2340", "#0d4b73", "#155f7d"
+    LIGHT_BLUE, OFFWHITE = "#a9c6f5", "#171b24"
 
     st.markdown(
         f"""
         <style>
-        .slide-navy {{background:{NAVY}; color:white; padding:2rem 2.2rem;
-            border-radius:0.6rem; margin-bottom:1rem;}}
-        .slide-navy h1, .slide-navy h2 {{color:white;}}
-        .slide-navy .kicker {{color:#8FA8D6; letter-spacing:2px; font-weight:600;
+        .slide-navy {{background:{NAVY}; color:{INK_PRIMARY}; padding:2rem 2.2rem;
+            border-radius:0.6rem; margin-bottom:1rem; border:1px solid #2c3654;}}
+        .slide-navy h1, .slide-navy h2 {{color:{INK_PRIMARY};}}
+        .slide-navy .kicker {{color:{LIGHT_BLUE}; letter-spacing:2px; font-weight:600;
             font-size:0.85rem; text-transform:uppercase;}}
         .slide-navy .subtitle {{color:{LIGHT_BLUE}; font-size:1.05rem; margin-top:0.4rem;}}
-        .quote-box {{background:{DEEPBLUE}; color:white; padding:1.2rem 1.4rem;
+        .quote-box {{background:{DEEPBLUE}; color:{INK_PRIMARY}; padding:1.2rem 1.4rem;
             border-radius:0.5rem; font-style:italic; height:100%;}}
-        .stat-tile {{background:{OFFWHITE}; border:1px solid #E3E7ED; border-radius:0.5rem;
+        .stat-tile {{background:{OFFWHITE}; border:1px solid {GRID}; border-radius:0.5rem;
             padding:1rem; text-align:center;}}
-        .stat-tile .value {{font-size:1.6rem; font-weight:700; color:{DEEPBLUE};}}
-        .stat-tile .label {{color:#5A6472; font-size:0.85rem; margin-top:0.3rem;}}
-        .method-card {{border-radius:0.5rem; padding:1rem; color:white; height:100%;}}
+        .stat-tile .value {{font-size:1.6rem; font-weight:700; color:#5b9bf2;}}
+        .stat-tile .label {{color:{INK_SECONDARY}; font-size:0.85rem; margin-top:0.3rem;}}
+        .method-card {{border-radius:0.5rem; padding:1rem; color:{INK_PRIMARY}; height:100%;}}
         </style>
         """,
         unsafe_allow_html=True,
@@ -401,9 +518,10 @@ with top_present:
             """
 - **PagBank** (fintech brasileira) — monitoramento, instrumentação e confiabilidade
 - Antes: sistemas embarcados (NVIDIA Jetson) na OptDriven
-- Cursa Data Science e Ciência da Computação Aplicada na FIAP
+- Cursa Engenharia de Software na FIAP
 - São Bernardo do Campo, Grande São Paulo
 - 🔗 [linkedin.com/in/luigi-mendes-cabrini-775907349](https://www.linkedin.com/in/luigi-mendes-cabrini-775907349)
+- 🔗 [github.com/CabriniJr](https://github.com/CabriniJr)
             """)
     with c2:
         st.markdown(
@@ -421,7 +539,7 @@ with top_present:
         st.markdown("**Formação & Experiência**")
         st.markdown(
             """
-- FIAP — Data Science e Ciência da Computação Aplicada
+- FIAP — Engenharia de Software
 - PagBank — testes sintéticos Datadog, monitoramento Splunk/LDAP
 - OptDriven — Python para sistemas embarcados (Jetson)
 - Projeto FIAP Global Solution: BrasilWatch AI / BrasilFire
@@ -472,7 +590,7 @@ with top_present:
     cards = [
         (m1, "Determinístico", "100% do tráfego\n(baseline / ground truth)", DEEPBLUE),
         (m2, "Sweet spot", "taxa balanceada\n(head: 15% · tail: erro+cauda sempre + base 15%)", TEAL),
-        (m3, "Agressivo", "taxa muito baixa\n(head: 1% · tail: erro+cauda sempre + base 1%)", "#8FA8D6"),
+        (m3, "Agressivo", "taxa muito baixa\n(head: 1% · tail: erro+cauda sempre + base 1%)", "#3a4a6b"),
     ]
     for col, title, desc, color in cards:
         col.markdown(
@@ -550,6 +668,136 @@ que preserva a confiança nos sinais críticos mesmo sob sampling agressivo.*
         unsafe_allow_html=True,
     )
 
+# ---------------------------------------------------------------------------
+# TAB 6 — Pipeline do experimento (arquitetura + comandos de referência)
+# ---------------------------------------------------------------------------
+with tab_pipeline:
+    st.subheader("Arquitetura do experimento real")
+    st.caption(
+        "6 pares app+coletor (2 contextos x 3 configs), cada um isolado "
+        "num par de serviços do docker compose. Passo a passo completo em "
+        "EXPERIMENTO.md — aqui vai a referência rápida.")
+
+    st.markdown(
+        """
+```
+Locust (seu host)  ──HTTP──▶  demo-app (FastAPI + OTel SDK)  ──OTLP──▶  OTel Collector  ──file exporter──▶  traces.json
+     200k reqs                 1 span por request                       sampler específico            (1 por par app+coletor)
+  mix 15/20/35/30%             tag business.domain                      da combinação
+                                status ERROR nos erros                  contexto x config
+```
+        """)
+
+    pipeline_rows = [
+        {"contexto": "head_based", "config": "deterministico", "sampler": "probabilistic_sampler 100%",
+            "coletor": "otel-collector-head-based-deterministico", "app": "app-head-based-deterministico", "porta": 8001},
+        {"contexto": "head_based", "config": "sweet_spot", "sampler": "probabilistic_sampler 15%",
+            "coletor": "otel-collector-head-based-sweet-spot", "app": "app-head-based-sweet-spot", "porta": 8002},
+        {"contexto": "head_based", "config": "agressivo", "sampler": "probabilistic_sampler 1%",
+            "coletor": "otel-collector-head-based-agressivo", "app": "app-head-based-agressivo", "porta": 8003},
+        {"contexto": "tail_based", "config": "deterministico", "sampler": "tail_sampling: always_sample",
+            "coletor": "otel-collector-tail-based-deterministico", "app": "app-tail-based-deterministico", "porta": 8004},
+        {"contexto": "tail_based", "config": "sweet_spot", "sampler": "tail_sampling: erro + cauda p95 + base 15%",
+            "coletor": "otel-collector-tail-based-sweet-spot", "app": "app-tail-based-sweet-spot", "porta": 8005},
+        {"contexto": "tail_based", "config": "agressivo", "sampler": "tail_sampling: erro + cauda p95 + base 1%",
+            "coletor": "otel-collector-tail-based-agressivo", "app": "app-tail-based-agressivo", "porta": 8006},
+    ]
+    st.dataframe(pd.DataFrame(pipeline_rows), width='stretch', hide_index=True)
+
+    st.markdown("**Comandos de referência** (uma combinação por vez — ver justificativa em EXPERIMENTO.md):")
+    st.code(
+        "# 1) sobe o par app+coletor\n"
+        "docker compose up --build -d otel-collector-<contexto>-<config> app-<contexto>-<config>\n\n"
+        "# 2) gera os 200k requests (mix 15/20/35/30%, para sozinho ao bater a meta)\n"
+        "locust -f locustfile.py --host=http://localhost:<porta> --headless -u 150 -r 30 -t 30m\n\n"
+        "# 3) espera o coletor esvaziar o buffer e derruba só esse par\n"
+        "sleep 10 && docker compose stop otel-collector-<contexto>-<config> app-<contexto>-<config>\n\n"
+        "# depois das 6 execuções — converte tudo pro CSV que este app lê\n"
+        "python scripts/otel_export_to_csv.py --all",
+        language="bash")
+
+    with st.expander("O que cada peça faz"):
+        st.markdown(
+            """
+- **`demo-app/`** — FastAPI com 4 rotas (`pix`, `checkout`, `/`, `/api/generic`),
+  cada uma virando 1 span OTel com o atributo `business.domain` e status
+  `ERROR` nos erros simulados. Os parâmetros de latência/erro são os
+  mesmos de `scripts/generate_sample_data.py`.
+- **`otel-config/*.yaml`** — as 6 pipelines (`receiver otlp` →
+  `probabilistic_sampler` ou `tail_sampling` → `file exporter`).
+- **`locustfile.py`** — pesos 15/20/35/30% por domínio e um listener que
+  para o teste sozinho assim que bate `TOTAL_REQUESTS` (usa
+  `LOCUST_TOTAL_REQUESTS` pra testar pequeno primeiro).
+- **`scripts/otel_export_to_csv.py`** — lê o `traces.json` de cada
+  coletor e gera o CSV no schema deste app (`trace_id, timestamp,
+  domain, latency_ms, is_error`).
+            """)
+
+# ---------------------------------------------------------------------------
+# TAB 7 — Metodologia
+# ---------------------------------------------------------------------------
+with tab_method:
+    st.subheader("Metodologia")
+    st.markdown(
+        """
+**Desenho do experimento.** Docker compose com 2 contextos de teste
+(head-based e tail-based). Em cada contexto, 3 execuções idênticas do
+mesmo teste de carga são recebidas por 3 coletores OTel configurados de
+forma diferente:
+- **Determinístico** — `probabilistic_sampler` a 100% (ground truth do
+  contexto: todo o tráfego é exportado).
+- **Sweet spot** — a taxa (head-based) ou taxa-base (tail-based)
+  considerada o melhor equilíbrio entre performance e confiança.
+- **Agressivo** — taxa (ou taxa-base) muito baixa, para mostrar o extremo
+  de alta performance / baixa confiança.
+
+Cada coletor exporta seu próprio CSV com o que **de fato** foi exportado
+— nada é simulado dentro do app. O determinístico de cada contexto serve
+como referência (baseline) para calcular a taxa efetiva de retenção e a
+margem de erro relativa dos outros dois coletores daquele mesmo contexto.
+
+**Por que 2 contextos.** Comparar head-based com tail-based só faz
+sentido nas mesmas condições de carga — por isso o mesmo desenho de 3
+coletores é repetido duas vezes, uma por estratégia de sampling. Isso
+isola o efeito da estratégia (head vs. tail) do efeito da taxa em si.
+
+**Intervalos de confiança.**
+- Latência (contínua): IC via CLT (t de Student) ou bootstrap percentil
+  (`utils/stats.py`).
+- Taxa de erro (proporção): IC de Wilson — estável mesmo com `n` pequeno
+  ou proporções perto de 0, o caso comum de taxas de erro baixas.
+- **MOE relativa (%)** = `halfwidth / valor_de_referência`, onde a
+  referência é sempre o valor do determinístico do mesmo contexto.
+
+**Curva teórica vs. pontos reais (aba Trade-off).** A curva de MOE em
+função da taxa usa o `σ` (desvio-padrão) observado no determinístico e a
+fórmula `SE = σ/√n` para extrapolar analiticamente qualquer taxa entre
+0,5% e 100%, sem precisar reamostrar. Os 3 pontos reais medidos (★) são
+sobrepostos a essa curva — se o experimento estiver bem controlado, eles
+devem cair perto da curva teórica; desvios grandes indicam algo
+interessante para discutir no relatório (viés de amostragem, mudança de
+carga entre execuções, etc.).
+
+**Score composto e sweet spot.**
+
+```
+ganho      = 1 − taxa_efetiva_de_sampling
+penalidade = clip(MOE% / limite_MOE%, 0, 1)
+score      = α·ganho − (1−α)·importância·penalidade
+```
+
+`α` e a `importância` por sinal são escolhas de negócio (sliders), não
+estatísticas — o app deixa ambos explícitos. Sinais críticos (ex.: PIX)
+amplificam a penalidade de confiança, empurrando o sweet spot para taxas
+mais altas.
+
+**Nota sobre "throughput".** O sampling não muda a taxa de requisições
+atendida pela aplicação — ele reduz o **volume exportado pelo pipeline de
+observabilidade** (CPU do coletor, rede, custo de ingestão/armazenamento
+no backend). É esse o "ganho de performance" medido aqui.
+        """
+    )
+
 with top_analysis:
     st.title("Intervalos de Confiança & Sampling em Coletores OTel")
     st.caption(
@@ -564,64 +812,247 @@ with top_analysis:
     k2.metric("Domínios/sinais", len(domains))
     k3.metric("Contextos carregados", sum(1 for c in CONTEXTS if data[c["key"]]["deterministico"][0] is not None))
 
-    (tab_overview, tab_compare, tab_tradeoff, tab_headtail, tab_dynamic,
-        tab_pipeline, tab_method) = st.tabs(
+    tab_overview, tab_compare, tab_tradeoff, tab_headtail, tab_dynamic = st.tabs(
         ["Visão geral", "Comparação dos coletores", "Trade-off & sweet spot",
-         "Head vs. Tail", "Sampling dinâmico", "Pipeline do experimento", "Metodologia"])
+         "Head vs. Tail", "Sampling dinâmico"])
 
     # ---------------------------------------------------------------------------
-    # TAB 1 — Visão geral (baseline determinístico, por contexto)
+    # TAB 1 — Visão geral, em leitura F: a pergunta central e os KPIs na barra
+    # superior, os bullets (com hover detalhando a conta) descendo pela haste
+    # à esquerda, e os gráficos à direita.
     # ---------------------------------------------------------------------------
     with tab_overview:
-        ctx_pick = st.selectbox("Contexto", [c["key"] for c in CONTEXTS],
-                                    format_func=lambda k: context_labels[k])
+        st.markdown(
+            f"""
+            <style>
+            .f-hero {{border-left:4px solid #5b9bf2; padding:0.9rem 1.2rem;
+                background:#171b24; border-radius:0 0.5rem 0.5rem 0; margin-bottom:0.8rem;}}
+            .f-hero .q {{font-size:1.25rem; font-weight:700; color:{INK_PRIMARY};}}
+            .f-hero .sub {{color:{INK_SECONDARY}; font-size:0.92rem; margin-top:0.35rem;}}
+            .f-bullets {{overflow:visible;}}
+            .f-bullet {{position:relative; border-left:3px solid var(--c);
+                padding:0.55rem 0.8rem; margin-bottom:0.55rem; background:#171b24;
+                border-radius:0 0.4rem 0.4rem 0; cursor:help;}}
+            .f-bullet .head {{font-weight:700; color:{INK_PRIMARY}; font-size:0.95rem;}}
+            .f-bullet .badge {{background:var(--c); color:#0d1017; border-radius:0.3rem;
+                padding:0.05rem 0.4rem; font-size:0.75rem; font-weight:700; margin-left:0.35rem;}}
+            .f-bullet .body {{color:{INK_SECONDARY}; font-size:0.86rem; margin-top:0.25rem;}}
+            .f-bullet .hint {{color:{INK_MUTED}; font-size:0.74rem; margin-top:0.2rem;}}
+            .f-bullet .tip {{visibility:hidden; opacity:0; position:absolute; z-index:999;
+                left:0; top:100%; margin-top:0.3rem; width:min(460px, 92vw);
+                background-color:#05070b !important; border:1px solid #3b4252;
+                border-radius:0.45rem; padding:0.75rem 0.9rem; color:{INK_SECONDARY};
+                font-size:0.8rem; line-height:1.55;
+                box-shadow:0 8px 28px rgba(0,0,0,0.85);
+                transition:opacity 0.12s ease;}}
+            .f-bullet:hover .tip {{visibility:visible; opacity:1;}}
+            .f-bullet .tip code {{color:#7fc4ff; background:transparent;}}
+            .f-bullet .tip b {{color:{INK_PRIMARY};}}
+            </style>
+            """, unsafe_allow_html=True)
+
+        # ── Barra superior do F: contexto, a pergunta e o slider de taxa ──
+        c_ctx, c_rate = st.columns([1, 2])
+        with c_ctx:
+            ctx_pick = st.selectbox("Contexto", [c["key"] for c in CONTEXTS],
+                                        format_func=lambda k: context_labels[k])
         det_df, src = data[ctx_pick]["deterministico"]
+
+        st.markdown(
+            '<div class="f-hero"><div class="q">Quanto precisamos amostrar — e quanta '
+            'confiança estamos dispostos a perder — para ganhar desempenho no pipeline '
+            'de observabilidade?</div>'
+            '<div class="sub">Amostrar menos reduz o volume exportado pelo coletor '
+            '(CPU, rede, custo de ingestão), mas encolhe o <i>n</i> e alarga o intervalo '
+            'de confiança na proporção de 1/√n. O ponto de equilíbrio não é único: '
+            'depende da <b>prioridade do sinal</b> (P1–P4, na barra lateral). '
+            'Passe o mouse em cada bullet para ver a conta.</div></div>',
+            unsafe_allow_html=True)
+
+        with c_rate:
+            rate_pct = st.slider(
+                "Taxa de amostragem simulada (%)", 0.5, 100.0, 15.0, 0.5,
+                help="Extrapola analiticamente (SE = σ/√n sobre o baseline 100%) "
+                     "quanta confiança se perde nesta taxa, sem reamostrar os dados.")
+        rate = rate_pct / 100.0
+
         if det_df is None:
             st.warning("Sem dado determinístico carregado para este contexto.")
         else:
-            st.caption(f"Fonte: {SOURCE_LABEL.get(src, src)}")
-            st.subheader(f"Baseline determinístico — {context_labels[ctx_pick]}")
-            rows = []
+            # ── KPIs da barra superior ──
+            ext_by_domain = {}
             for d in domains:
                 sub = det_df[det_df["domain"] == d]
-                if len(sub) == 0:
+                e = extrapolate_at_rate(sub, rate, confidence)
+                if e is None:
                     continue
-                lat = mean_ci(sub["latency_ms"].values, confidence, ci_method)
-                err = st_stats.wilson_ci(int(sub["is_error"].sum()), len(sub), confidence)
-                rows.append({"domain": d, "n": len(sub), "latencia_media_ms": lat["mean"],
-                                "ic_lat_lo": lat["lo"], "ic_lat_hi": lat["hi"],
-                                "taxa_erro": err["p"], "ic_erro_lo": err["lo"], "ic_erro_hi": err["hi"]})
-            ov = pd.DataFrame(rows)
+                pen = max(st_stats.confidence_penalty(e["lat_moe_pct"], moe_cap),
+                          st_stats.confidence_penalty(e["err_moe_pct"], moe_cap))
+                e["penalty"] = pen
+                e["score"] = st_stats.composite_score(e["gain"], pen, importance[d], alpha)
+                ext_by_domain[d] = e
 
-            fig = go.Figure()
-            for _, r in ov.iterrows():
-                fig.add_trace(go.Scatter(x=[r["ic_lat_lo"], r["ic_lat_hi"]], y=[r["domain"]] * 2,
-                                            mode="lines", line=dict(color=colors[r["domain"]], width=6),
-                                            showlegend=False, hoverinfo="skip"))
-                fig.add_trace(go.Scatter(x=[r["latencia_media_ms"]], y=[r["domain"]], mode="markers",
-                                            marker=dict(color=colors[r["domain"]], size=12,
-                                            line=dict(color="white", width=1)),
-                                            name=r["domain"],
-                                            hovertemplate=f"{r['domain']}<br>média: %{{x:.1f}} ms<extra></extra>"))
-            fig = base_layout(fig, f"Latência média por sinal — IC {int(confidence*100)}%",
-                                "Latência média (ms)", "", "Sinal")
-            st.plotly_chart(fig, width='stretch')
+            if not ext_by_domain:
+                st.warning("Dados insuficientes para calcular os indicadores.")
+            else:
+                worst_lat = max(e["lat_moe_pct"] for e in ext_by_domain.values())
+                kept = sum(e["n"] for e in ext_by_domain.values())
+                total = sum(e["n_base"] for e in ext_by_domain.values())
+                w_score = float(np.average(
+                    [e["score"] for e in ext_by_domain.values()],
+                    weights=[importance[d] for d in ext_by_domain]))
+                p1_ok = all(e["penalty"] < 1 for d, e in ext_by_domain.items()
+                            if priority[d] == "P1")
 
-            fig2 = go.Figure()
-            for d in domains:
-                sub = det_df[det_df["domain"] == d]["latency_ms"]
-                if len(sub):
-                    fig2.add_trace(go.Box(y=sub, name=d, marker_color=colors[d], boxpoints=False))
-            fig2 = base_layout(fig2, "Distribuição de latência por sinal", "", "Latência (ms)")
-            st.plotly_chart(fig2, width='stretch')
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Redução de exportação", f"{(1 - rate) * 100:.1f}%",
+                          f"{br(total - kept)} spans a menos")
+                k2.metric("Spans retidos", br(kept), f"de {br(total)}", delta_color="off")
+                k3.metric("Pior MOE de latência", f"{worst_lat:.2f}%",
+                          f"limite tolerado: {moe_cap}%", delta_color="off")
+                k4.metric("Score ponderado por prioridade", f"{w_score:+.3f}",
+                          "P1 dentro do limite" if p1_ok else "P1 fora do limite",
+                          delta_color="off")
 
-            with st.expander("Ver tabela"):
-                show = ov.copy()
-                for c in ["latencia_media_ms", "ic_lat_lo", "ic_lat_hi"]:
-                    show[c] = show[c].round(1)
-                for c in ["taxa_erro", "ic_erro_lo", "ic_erro_hi"]:
-                    show[c] = (show[c] * 100).round(2)
-                st.dataframe(show, width='stretch')
+                # ── Haste do F: bullets à esquerda, gráficos à direita ──
+                c_bul, c_chart = st.columns([1.05, 1.6])
+
+                with c_bul:
+                    st.markdown(f"**Por sinal, a {rate_pct:.1f}% de amostragem**")
+                    html = ['<div class="f-bullets">']
+                    for d in sorted(ext_by_domain, key=lambda x: priority[x]):
+                        e = ext_by_domain[d]
+                        p = priority[d]
+                        base = extrapolate_at_rate(det_df[det_df["domain"] == d], 1.0, confidence)
+                        # A penalidade do score é o PIOR entre os dois sinais de
+                        # confiança (latência e taxa de erro): basta um estourar.
+                        pen_lat = st_stats.confidence_penalty(e["lat_moe_pct"], moe_cap)
+                        pen_err = st_stats.confidence_penalty(e["err_moe_pct"], moe_cap)
+                        binding = "latência" if pen_lat >= pen_err else "taxa de erro"
+                        verdict = ("dentro do limite" if e["penalty"] < 1
+                                   else f"ESTOURA o limite pela {binding}")
+                        se = e["std_base"] / np.sqrt(e["n"])
+                        html.append(
+                            f'<div class="f-bullet" style="--c:{colors[d]}">'
+                            f'<div class="head">{d}<span class="badge">{p}</span></div>'
+                            f'<div class="body">−{e["gain"] * 100:.0f}% de volume exportado '
+                            f'em troca de MOE de latência <b>{base["lat_moe_pct"]:.2f}% → '
+                            f'{e["lat_moe_pct"]:.2f}%</b> e de taxa de erro '
+                            f'<b>{base["err_moe_pct"]:.1f}% → {e["err_moe_pct"]:.1f}%</b> '
+                            f'({verdict}). Score {e["score"]:+.3f}.</div>'
+                            f'<div class="hint">▸ passe o mouse para ver a conta</div>'
+                            f'<div class="tip">'
+                            f'<b>Amostra.</b> n = {br(e["n_base"])} × {rate:.3f} = '
+                            f'<b>{br(e["n"])}</b> spans<br>'
+                            f'<b>Erro-padrão.</b> SE = σ/√n = {e["std_base"]:.1f} / '
+                            f'√{br(e["n"])} = {se:.2f} ms<br>'
+                            f'<b>MOE de latência.</b> t<sub>{confidence:.2f}</sub> × SE = '
+                            f'{e["t_crit"]:.3f} × {se:.2f} = {e["halfwidth_ms"]:.2f} ms '
+                            f'→ relativa: {e["halfwidth_ms"]:.2f} / {e["mean_base"]:.1f} ms = '
+                            f'<b>{e["lat_moe_pct"]:.2f}%</b><br>'
+                            f'<b>MOE de taxa de erro.</b> IC de Wilson sobre '
+                            f'p = {e["p_base"]:.3%} com n = {br(e["n"])} '
+                            f'→ relativa: <b>{e["err_moe_pct"]:.1f}%</b><br>'
+                            f'<b>Ganho.</b> 1 − {rate:.3f} = <b>{e["gain"]:.3f}</b><br>'
+                            f'<b>Penalidade.</b> pior das duas MOEs, saturada em {moe_cap}%: '
+                            f'max( min({e["lat_moe_pct"]:.2f}/{moe_cap} ; 1) ; '
+                            f'min({e["err_moe_pct"]:.1f}/{moe_cap} ; 1) ) = '
+                            f'max({pen_lat:.3f} ; {pen_err:.3f}) = <b>{e["penalty"]:.3f}</b> '
+                            f'— quem manda aqui é a <b>{binding}</b><br>'
+                            f'<b>Prioridade {p}</b> → importância {importance[d]:.2f} '
+                            f'({PRIORITY_DESC[p]})<br>'
+                            f'<b>Score.</b> α×ganho − (1−α)×importância×penalidade = '
+                            f'{alpha:.2f}×{e["gain"]:.3f} − '
+                            f'{1 - alpha:.2f}×{importance[d]:.2f}×{e["penalty"]:.3f} = '
+                            f'<b>{e["score"]:+.3f}</b>'
+                            f'</div></div>')
+                    html.append('</div>')
+                    st.markdown("".join(html), unsafe_allow_html=True)
+
+                with c_chart:
+                    # Gráfico 1 — rate() normalizado sobreposto: os 3 coletores
+                    # na mesma escala, para ver a dispersão crescer.
+                    dom_pick = st.selectbox(
+                        "Sinal no gráfico de rate()",
+                        sorted(ext_by_domain, key=lambda d: priority[d]),
+                        format_func=lambda d: f"{d} · {priority[d]}", key="dom_rate")
+                    fig_rate = go.Figure()
+                    dashes = {"deterministico": "solid", "sweet_spot": "dash", "agressivo": "dot"}
+                    widths = {"deterministico": 3, "sweet_spot": 2, "agressivo": 1.6}
+                    n_det_dom = len(det_df[det_df["domain"] == dom_pick])
+                    for i, run in enumerate(RUNS):
+                        rdf, _ = data[ctx_pick][run["key"]]
+                        if rdf is None:
+                            continue
+                        s = rate_series(rdf, dom_pick)
+                        if s is None:
+                            continue
+                        eff = len(rdf[rdf["domain"] == dom_pick]) / n_det_dom if n_det_dom else np.nan
+                        if not eff or np.isnan(eff):
+                            continue
+                        fig_rate.add_trace(go.Scatter(
+                            x=s.index, y=s.values / eff, mode="lines",
+                            name=f"{run['label']} ({eff:.1%})",
+                            line=dict(color=CATEGORICAL[i], width=widths[run["key"]],
+                                      dash=dashes[run["key"]]),
+                            hovertemplate=(f"{run['label']}<br>rate estimado: "
+                                           "%{y:.1f} req/s<extra></extra>")))
+                    fig_rate = base_layout(
+                        fig_rate,
+                        f"rate() normalizado — {dom_pick} (média móvel de 3 s)",
+                        "Tempo decorrido do run (s)", "Requisições/s estimadas", "Coletor")
+                    st.plotly_chart(fig_rate, width='stretch')
+                    st.caption(
+                        "As três curvas estimam a MESMA taxa real (cada uma dividida pela "
+                        "sua taxa efetiva de retenção). O que muda é a **dispersão**: com "
+                        "menos amostra, a média móvel oscila muito mais em torno do mesmo "
+                        "valor — é exatamente essa variância extra que o intervalo de "
+                        "confiança quantifica.")
+
+                    # Gráfico 2 — IC da latência média no baseline 100%
+                    rows = []
+                    for d in domains:
+                        sub = det_df[det_df["domain"] == d]
+                        if len(sub) == 0:
+                            continue
+                        lat = mean_ci(sub["latency_ms"].values, confidence, ci_method)
+                        err = st_stats.wilson_ci(int(sub["is_error"].sum()), len(sub), confidence)
+                        rows.append({"domain": d, "n": len(sub), "latencia_media_ms": lat["mean"],
+                                        "ic_lat_lo": lat["lo"], "ic_lat_hi": lat["hi"],
+                                        "taxa_erro": err["p"], "ic_erro_lo": err["lo"],
+                                        "ic_erro_hi": err["hi"]})
+                    ov = pd.DataFrame(rows)
+
+                    fig = go.Figure()
+                    for _, r in ov.iterrows():
+                        fig.add_trace(go.Scatter(x=[r["ic_lat_lo"], r["ic_lat_hi"]],
+                                                    y=[r["domain"]] * 2, mode="lines",
+                                                    line=dict(color=colors[r["domain"]], width=6),
+                                                    showlegend=False, hoverinfo="skip"))
+                        fig.add_trace(go.Scatter(x=[r["latencia_media_ms"]], y=[r["domain"]],
+                                                    mode="markers",
+                                                    marker=dict(color=colors[r["domain"]], size=12,
+                                                    line=dict(color=SURFACE, width=1)),
+                                                    name=r["domain"],
+                                                    hovertemplate=f"{r['domain']}<br>média: %{{x:.1f}} ms<extra></extra>"))
+                    fig = base_layout(fig, f"Latência média por sinal — IC {int(confidence*100)}% (baseline 100%)",
+                                        "Latência média (ms)", "", "Sinal")
+                    st.plotly_chart(fig, width='stretch')
+
+                with st.expander("Ver tabela — baseline determinístico e projeção na taxa escolhida"):
+                    show = ov.copy()
+                    for c in ["latencia_media_ms", "ic_lat_lo", "ic_lat_hi"]:
+                        show[c] = show[c].round(1)
+                    for c in ["taxa_erro", "ic_erro_lo", "ic_erro_hi"]:
+                        show[c] = (show[c] * 100).round(2)
+                    show["prioridade"] = show["domain"].map(priority)
+                    show[f"n @ {rate_pct:.1f}%"] = show["domain"].map(
+                        lambda d: ext_by_domain[d]["n"] if d in ext_by_domain else np.nan)
+                    show[f"MOE lat @ {rate_pct:.1f}% (%)"] = show["domain"].map(
+                        lambda d: round(ext_by_domain[d]["lat_moe_pct"], 2) if d in ext_by_domain else np.nan)
+                    show["score"] = show["domain"].map(
+                        lambda d: round(ext_by_domain[d]["score"], 3) if d in ext_by_domain else np.nan)
+                    st.dataframe(show, width='stretch', hide_index=True)
 
     # ---------------------------------------------------------------------------
     # TAB 2 — Comparação real dos 3 coletores, lado a lado por contexto
@@ -793,7 +1224,8 @@ with top_analysis:
         else:
             from utils import sampling as smp
             cols = st.columns(len(domains))
-            rate_by_domain = {d: c.slider(d, 0.01, 1.0, max(0.05, default_importance(d)), 0.01, key=f"rate_{d}")
+            rate_by_domain = {d: c.slider(f"{d} · {priority[d]}", 0.01, 1.0,
+                                            max(0.05, importance[d]), 0.01, key=f"rate_{d}")
                                 for d, c in zip(domains, cols)}
             dyn = smp.dynamic_domain_sample(det_df, rate_by_domain)
 
@@ -832,132 +1264,3 @@ with top_analysis:
                 show["score"] = show["score"].round(3)
                 st.dataframe(show, width='stretch')
 
-    # ---------------------------------------------------------------------------
-    # TAB 6 — Pipeline do experimento (arquitetura + comandos de referência)
-    # ---------------------------------------------------------------------------
-    with tab_pipeline:
-        st.subheader("Arquitetura do experimento real")
-        st.caption(
-            "6 pares app+coletor (2 contextos x 3 configs), cada um isolado "
-            "num par de serviços do docker compose. Passo a passo completo em "
-            "EXPERIMENTO.md — aqui vai a referência rápida.")
-
-        st.markdown(
-            """
-    ```
-    Locust (seu host)  ──HTTP──▶  demo-app (FastAPI + OTel SDK)  ──OTLP──▶  OTel Collector  ──file exporter──▶  traces.json
-         200k reqs                 1 span por request                       sampler específico            (1 por par app+coletor)
-      mix 15/20/35/30%             tag business.domain                      da combinação
-                                    status ERROR nos erros                  contexto x config
-    ```
-            """)
-
-        pipeline_rows = [
-            {"contexto": "head_based", "config": "deterministico", "sampler": "probabilistic_sampler 100%",
-                "coletor": "otel-collector-head-based-deterministico", "app": "app-head-based-deterministico", "porta": 8001},
-            {"contexto": "head_based", "config": "sweet_spot", "sampler": "probabilistic_sampler 15%",
-                "coletor": "otel-collector-head-based-sweet-spot", "app": "app-head-based-sweet-spot", "porta": 8002},
-            {"contexto": "head_based", "config": "agressivo", "sampler": "probabilistic_sampler 1%",
-                "coletor": "otel-collector-head-based-agressivo", "app": "app-head-based-agressivo", "porta": 8003},
-            {"contexto": "tail_based", "config": "deterministico", "sampler": "tail_sampling: always_sample",
-                "coletor": "otel-collector-tail-based-deterministico", "app": "app-tail-based-deterministico", "porta": 8004},
-            {"contexto": "tail_based", "config": "sweet_spot", "sampler": "tail_sampling: erro + cauda p95 + base 15%",
-                "coletor": "otel-collector-tail-based-sweet-spot", "app": "app-tail-based-sweet-spot", "porta": 8005},
-            {"contexto": "tail_based", "config": "agressivo", "sampler": "tail_sampling: erro + cauda p95 + base 1%",
-                "coletor": "otel-collector-tail-based-agressivo", "app": "app-tail-based-agressivo", "porta": 8006},
-        ]
-        st.dataframe(pd.DataFrame(pipeline_rows), width='stretch', hide_index=True)
-
-        st.markdown("**Comandos de referência** (uma combinação por vez — ver justificativa em EXPERIMENTO.md):")
-        st.code(
-            "# 1) sobe o par app+coletor\n"
-            "docker compose up --build -d otel-collector-<contexto>-<config> app-<contexto>-<config>\n\n"
-            "# 2) gera os 200k requests (mix 15/20/35/30%, para sozinho ao bater a meta)\n"
-            "locust -f locustfile.py --host=http://localhost:<porta> --headless -u 150 -r 30 -t 30m\n\n"
-            "# 3) espera o coletor esvaziar o buffer e derruba só esse par\n"
-            "sleep 10 && docker compose stop otel-collector-<contexto>-<config> app-<contexto>-<config>\n\n"
-            "# depois das 6 execuções — converte tudo pro CSV que este app lê\n"
-            "python scripts/otel_export_to_csv.py --all",
-            language="bash")
-
-        with st.expander("O que cada peça faz"):
-            st.markdown(
-                """
-    - **`demo-app/`** — FastAPI com 4 rotas (`pix`, `checkout`, `/`, `/api/generic`),
-      cada uma virando 1 span OTel com o atributo `business.domain` e status
-      `ERROR` nos erros simulados. Os parâmetros de latência/erro são os
-      mesmos de `scripts/generate_sample_data.py`.
-    - **`otel-config/*.yaml`** — as 6 pipelines (`receiver otlp` →
-      `probabilistic_sampler` ou `tail_sampling` → `file exporter`).
-    - **`locustfile.py`** — pesos 15/20/35/30% por domínio e um listener que
-      para o teste sozinho assim que bate `TOTAL_REQUESTS` (usa
-      `LOCUST_TOTAL_REQUESTS` pra testar pequeno primeiro).
-    - **`scripts/otel_export_to_csv.py`** — lê o `traces.json` de cada
-      coletor e gera o CSV no schema deste app (`trace_id, timestamp,
-      domain, latency_ms, is_error`).
-                """)
-
-    # ---------------------------------------------------------------------------
-    # TAB 7 — Metodologia
-    # ---------------------------------------------------------------------------
-    with tab_method:
-        st.subheader("Metodologia")
-        st.markdown(
-            """
-    **Desenho do experimento.** Docker compose com 2 contextos de teste
-    (head-based e tail-based). Em cada contexto, 3 execuções idênticas do
-    mesmo teste de carga são recebidas por 3 coletores OTel configurados de
-    forma diferente:
-    - **Determinístico** — `probabilistic_sampler` a 100% (ground truth do
-      contexto: todo o tráfego é exportado).
-    - **Sweet spot** — a taxa (head-based) ou taxa-base (tail-based)
-      considerada o melhor equilíbrio entre performance e confiança.
-    - **Agressivo** — taxa (ou taxa-base) muito baixa, para mostrar o extremo
-      de alta performance / baixa confiança.
-
-    Cada coletor exporta seu próprio CSV com o que **de fato** foi exportado
-    — nada é simulado dentro do app. O determinístico de cada contexto serve
-    como referência (baseline) para calcular a taxa efetiva de retenção e a
-    margem de erro relativa dos outros dois coletores daquele mesmo contexto.
-
-    **Por que 2 contextos.** Comparar head-based com tail-based só faz
-    sentido nas mesmas condições de carga — por isso o mesmo desenho de 3
-    coletores é repetido duas vezes, uma por estratégia de sampling. Isso
-    isola o efeito da estratégia (head vs. tail) do efeito da taxa em si.
-
-    **Intervalos de confiança.**
-    - Latência (contínua): IC via CLT (t de Student) ou bootstrap percentil
-      (`utils/stats.py`).
-    - Taxa de erro (proporção): IC de Wilson — estável mesmo com `n` pequeno
-      ou proporções perto de 0, o caso comum de taxas de erro baixas.
-    - **MOE relativa (%)** = `halfwidth / valor_de_referência`, onde a
-      referência é sempre o valor do determinístico do mesmo contexto.
-
-    **Curva teórica vs. pontos reais (aba Trade-off).** A curva de MOE em
-    função da taxa usa o `σ` (desvio-padrão) observado no determinístico e a
-    fórmula `SE = σ/√n` para extrapolar analiticamente qualquer taxa entre
-    0,5% e 100%, sem precisar reamostrar. Os 3 pontos reais medidos (★) são
-    sobrepostos a essa curva — se o experimento estiver bem controlado, eles
-    devem cair perto da curva teórica; desvios grandes indicam algo
-    interessante para discutir no relatório (viés de amostragem, mudança de
-    carga entre execuções, etc.).
-
-    **Score composto e sweet spot.**
-
-    ```
-    ganho      = 1 − taxa_efetiva_de_sampling
-    penalidade = clip(MOE% / limite_MOE%, 0, 1)
-    score      = α·ganho − (1−α)·importância·penalidade
-    ```
-
-    `α` e a `importância` por sinal são escolhas de negócio (sliders), não
-    estatísticas — o app deixa ambos explícitos. Sinais críticos (ex.: PIX)
-    amplificam a penalidade de confiança, empurrando o sweet spot para taxas
-    mais altas.
-
-    **Nota sobre "throughput".** O sampling não muda a taxa de requisições
-    atendida pela aplicação — ele reduz o **volume exportado pelo pipeline de
-    observabilidade** (CPU do coletor, rede, custo de ingestão/armazenamento
-    no backend). É esse o "ganho de performance" medido aqui.
-            """
-        )
