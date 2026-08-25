@@ -236,8 +236,8 @@ if cmp_df.empty:
 # ---------------------------------------------------------------------------
 # Navegação de topo (estrutura exigida pelo CP1)
 # ---------------------------------------------------------------------------
-top_home, top_qualif, top_skills, top_analysis = st.tabs(
-    ["Quem sou eu", "Minhas Qualificações", "Skills", "Análise de Dados"])
+top_home, top_qualif, top_skills, top_present, top_analysis = st.tabs(
+    ["Quem sou eu", "Minhas Qualificações", "Skills", "Apresentação", "Análise de Dados"])
 
 with top_home:
     st.title("Luigi")
@@ -270,6 +270,8 @@ Meu momento atual é de **construir as bases**: leitura técnica contínua
 (Learning OpenTelemetry, Observability Engineering, Designing
 Data-Intensive Applications, o livro de SRE do Google) combinada com um
 laboratório prático por semana — este projeto é um desses labs.
+
+🔗 [LinkedIn — Luigi Mendes Cabrini](https://www.linkedin.com/in/luigi-mendes-cabrini-775907349)
         """)
 
 with top_qualif:
@@ -346,6 +348,207 @@ with top_skills:
         "As skills e experiências acima vieram do histórico de conversas "
         "com o Claude — revise antes da entrega e ajuste o que não estiver "
         "atualizado.")
+
+with top_present:
+    NAVY, DEEPBLUE, TEAL = "#21295C", "#065A82", "#1C7293"
+    LIGHT_BLUE, OFFWHITE = "#CADCFC", "#F5F7FA"
+
+    st.markdown(
+        f"""
+        <style>
+        .slide-navy {{background:{NAVY}; color:white; padding:2rem 2.2rem;
+            border-radius:0.6rem; margin-bottom:1rem;}}
+        .slide-navy h1, .slide-navy h2 {{color:white;}}
+        .slide-navy .kicker {{color:#8FA8D6; letter-spacing:2px; font-weight:600;
+            font-size:0.85rem; text-transform:uppercase;}}
+        .slide-navy .subtitle {{color:{LIGHT_BLUE}; font-size:1.05rem; margin-top:0.4rem;}}
+        .quote-box {{background:{DEEPBLUE}; color:white; padding:1.2rem 1.4rem;
+            border-radius:0.5rem; font-style:italic; height:100%;}}
+        .stat-tile {{background:{OFFWHITE}; border:1px solid #E3E7ED; border-radius:0.5rem;
+            padding:1rem; text-align:center;}}
+        .stat-tile .value {{font-size:1.6rem; font-weight:700; color:{DEEPBLUE};}}
+        .stat-tile .label {{color:#5A6472; font-size:0.85rem; margin-top:0.3rem;}}
+        .method-card {{border-radius:0.5rem; padding:1rem; color:white; height:100%;}}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.caption(
+        "Apresentação coringa — plano B caso o dashboard fique indisponível "
+        "na correção; o conteúdo é o mesmo, em formato de slides.")
+
+    # Slide 1 — Título
+    st.markdown(
+        f"""
+        <div class="slide-navy">
+        <div class="kicker">CP1 · DASHBOARD PROFISSIONAL · FIAP</div>
+        <h1>Intervalos de Confiança & Sampling<br>em Coletores OTel</h1>
+        <div class="subtitle">Trabalho de Estatística — laboratório real de sampling em
+        coletores OpenTelemetry, analisado com os conceitos da disciplina.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Slide 2 — Quem sou eu
+    st.subheader("Quem sou eu")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.markdown("**Luigi Mendes Cabrini**")
+        st.caption("Platform Engineer Júnior · Observabilidade")
+        st.markdown(
+            """
+- **PagBank** (fintech brasileira) — monitoramento, instrumentação e confiabilidade
+- Antes: sistemas embarcados (NVIDIA Jetson) na OptDriven
+- Cursa Data Science e Ciência da Computação Aplicada na FIAP
+- São Bernardo do Campo, Grande São Paulo
+- 🔗 [linkedin.com/in/luigi-mendes-cabrini-775907349](https://www.linkedin.com/in/luigi-mendes-cabrini-775907349)
+            """)
+    with c2:
+        st.markdown(
+            '<div class="quote-box">“Este dashboard é exatamente esse cruzamento: '
+            'um laboratório real de sampling em coletores OTel, analisado com os '
+            'conceitos estatísticos da disciplina.”</div>',
+            unsafe_allow_html=True)
+
+    st.divider()
+
+    # Slide 3 — Qualificações & Skills
+    st.subheader("Minhas Qualificações & Skills")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Formação & Experiência**")
+        st.markdown(
+            """
+- FIAP — Data Science e Ciência da Computação Aplicada
+- PagBank — testes sintéticos Datadog, monitoramento Splunk/LDAP
+- OptDriven — Python para sistemas embarcados (Jetson)
+- Projeto FIAP Global Solution: BrasilWatch AI / BrasilFire
+            """)
+    with c2:
+        st.markdown("**Skills técnicas**")
+        st.markdown(
+            """
+- Python, Java
+- OpenTelemetry (instrumentação manual, OTel Collector, sampling)
+- Docker / Docker Compose, conceitos de Kubernetes
+- Estatística aplicada (IC, bootstrap), pandas, Plotly, Streamlit
+- Locust, SQL, Git
+            """)
+    st.caption("Inglês: TOEFL B2 geral, C1 em listening/reading · Português nativo")
+
+    st.divider()
+
+    # Slide 4 — O problema
+    st.subheader("O problema: sampling em observabilidade")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.markdown(
+            """
+- Capturar 100% dos spans/traces em produção é caro: CPU do coletor, rede,
+  custo de ingestão e armazenamento no backend.
+- Reduzir o sampling economiza recursos — mas reduz o tamanho da amostra, o
+  que aumenta a margem de erro (MOE) das métricas estimadas (SE = σ/√n).
+- Sinais diferentes têm importância diferente: uma transação PIX que falha
+  não pode "sumir" por causa do sampling, mas uma página genérica de site
+  tolera taxas mais agressivas.
+            """)
+    with c2:
+        s1, s2 = st.columns(2)
+        s1.markdown('<div class="stat-tile"><div class="value">IC</div>'
+                        '<div class="label">Intervalo de Confiança<br>(CLT, bootstrap, Wilson)</div></div>',
+                        unsafe_allow_html=True)
+        s2.markdown('<div class="stat-tile"><div class="value">Score</div>'
+                        '<div class="label">throughput × confiança<br>× importância do sinal</div></div>',
+                        unsafe_allow_html=True)
+
+    st.divider()
+
+    # Slide 5 — Metodologia
+    st.subheader("Metodologia: o experimento real")
+    st.caption("2 contextos × 3 coletores OTel, rodando de verdade (docker compose / execução local)")
+    m1, m2, m3 = st.columns(3)
+    cards = [
+        (m1, "Determinístico", "100% do tráfego\n(baseline / ground truth)", DEEPBLUE),
+        (m2, "Sweet spot", "taxa balanceada\n(head: 15% · tail: erro+cauda sempre + base 15%)", TEAL),
+        (m3, "Agressivo", "taxa muito baixa\n(head: 1% · tail: erro+cauda sempre + base 1%)", "#8FA8D6"),
+    ]
+    for col, title, desc, color in cards:
+        col.markdown(
+            f'<div class="method-card" style="background:{color};">'
+            f'<b>{title}</b><br><span style="font-size:0.85rem;">{desc}</span></div>',
+            unsafe_allow_html=True)
+    st.markdown(
+        """
+*Rodado 2×: contexto head-based (probabilistic_sampler) e contexto
+tail-based (tail_sampling — erros e cauda p95 sempre mantidos). Demo-app
+instrumentada com OpenTelemetry, 4 domínios de sinal (pix, checkout,
+site_latency, api_generic), gerador de carga Locust com parada exata na
+meta de requisições.*
+        """)
+
+    st.divider()
+
+    # Slide 6 — Resultado real
+    st.subheader("Resultado real: retenção por contexto")
+    st.caption("Teste local já executado (20 mil requisições/coletor) — números reais, não simulados")
+    st.table(pd.DataFrame(
+        [["Head-based", "20.124 (100%)", "3.016 (15,0%)", "217 (1,1%)"],
+         ["Tail-based", "19.968 (100%)", "4.838 (24,2%)", "2.260 (11,3%)"]],
+        columns=["Contexto", "Determinístico", "Sweet spot", "Agressivo"],
+    ).set_index("Contexto"))
+    st.markdown(
+        """
+*O tail-based retém muito mais que a taxa-base nominal (1% → 11,3% no
+agressivo) porque erros e picos de latência são sempre mantidos — é isso
+que preserva a confiança nos sinais críticos mesmo sob sampling agressivo.*
+        """)
+
+    st.divider()
+
+    # Slide 7 — Trade-off
+    st.subheader("Trade-off: performance × confiança")
+    st.code("score = α·ganho_throughput − (1−α)·importância·penalidade_confiança", language="text")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.markdown(
+            """
+- **ganho** = 1 − taxa de sampling (economia no pipeline de observabilidade)
+- **penalidade** = MOE% relativa, saturada em um limite configurável
+- **importância** = peso do sinal (PIX = 1,0 · latência genérica = 0,2)
+- **α** = peso performance × confiança, ajustável no dashboard (aba
+  *Sampling dinâmico*)
+            """)
+    with c2:
+        st.markdown(
+            f'<div class="method-card" style="background:{NAVY};">'
+            'Sinais críticos (PIX) →<br><b>sweet spot mais alto</b><br><br>'
+            'Sinais tolerantes (latência genérica) →<br><b>sweet spot mais agressivo</b>'
+            '</div>', unsafe_allow_html=True)
+
+    st.divider()
+
+    # Slide 8 — Conclusão
+    st.markdown(
+        f"""
+        <div class="slide-navy">
+        <h2>Conclusão</h2>
+        <ul>
+        <li>Sampling agressivo economiza pipeline, mas custa confiança estatística
+        de forma previsível (~1/√n)</li>
+        <li>Tail-based preserva confiança em sinais raros/críticos mesmo sob taxas
+        baixas — head-based não</li>
+        <li>O sweet spot certo depende da importância do sinal, não é um número
+        único para o sistema inteiro</li>
+        <li>Todo o pipeline (demo-app instrumentada, 6 coletores, gerador de carga,
+        conversão OTLP→CSV) está reproduzível — ver EXPERIMENTO.md</li>
+        </ul>
+        <div class="subtitle">Repositório: github.com/CabriniJr/otelabs</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 with top_analysis:
     st.title("Intervalos de Confiança & Sampling em Coletores OTel")
